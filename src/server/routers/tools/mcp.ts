@@ -12,6 +12,7 @@ import { serverDatabase, telemetry } from '@/libs/trpc/lambda/middleware';
 import { FileService } from '@/server/services/file';
 import { mcpService } from '@/server/services/mcp';
 import { processContentBlocks } from '@/server/services/mcp/contentProcessor';
+import { REAUTH_REQUIRED, resolveMcpOAuthToken } from '@/server/services/mcp/oauth';
 
 import { scheduleToolCallReport } from './_helpers';
 
@@ -77,12 +78,28 @@ const mcpProcedure = authedProcedure
 export const mcpRouter = router({
   getStreamableMcpServerManifest: mcpProcedure
     .input(GetStreamableMcpServerManifestInputSchema)
-    .query(async ({ input }) => {
+    .query(async ({ input, ctx }) => {
+      let auth = input.auth;
+      if (input.auth?.type === 'oauth' && ctx.userId && ctx.serverDB) {
+        try {
+          const resolved = await resolveMcpOAuthToken(ctx.serverDB, ctx.userId, input.identifier);
+          auth = resolved;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : '';
+          if ((err as any).code === REAUTH_REQUIRED || message === REAUTH_REQUIRED) {
+            throw new TRPCError({
+              code: 'UNAUTHORIZED',
+              message: REAUTH_REQUIRED,
+            });
+          }
+          throw err;
+        }
+      }
       return await mcpService.getStreamableMcpServerManifest(
         input.identifier,
         input.url,
         input.metadata,
-        input.auth,
+        auth,
         input.headers,
       );
     }),
@@ -142,6 +159,28 @@ export const mcpRouter = router({
       let result: Awaited<ReturnType<typeof mcpService.callTool>> | undefined;
 
       try {
+        let clientParams = input.params;
+        if (
+          input.params.type === 'http' &&
+          input.params.auth?.type === 'oauth' &&
+          ctx.userId &&
+          ctx.serverDB
+        ) {
+          try {
+            const auth = await resolveMcpOAuthToken(ctx.serverDB, ctx.userId, input.params.name);
+            clientParams = { ...input.params, auth };
+          } catch (err) {
+            const message = err instanceof Error ? err.message : '';
+            if ((err as any).code === REAUTH_REQUIRED || message === REAUTH_REQUIRED) {
+              throw new TRPCError({
+                code: 'UNAUTHORIZED',
+                message: REAUTH_REQUIRED,
+              });
+            }
+            throw err;
+          }
+        }
+
         // Create a closure that binds fileService and userId to processContentBlocks
         const boundProcessContentBlocks = async (blocks: ToolCallContent[]) => {
           return processContentBlocks(blocks, ctx.fileService);
@@ -150,7 +189,7 @@ export const mcpRouter = router({
         // Pass the validated params, toolName, args, and bound processContentBlocks to the service
         result = await mcpService.callTool({
           argsStr: input.args,
-          clientParams: input.params,
+          clientParams,
           processContentBlocks: boundProcessContentBlocks,
           toolName: input.toolName,
         });

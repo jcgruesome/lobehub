@@ -1,7 +1,7 @@
 import { Alert, Button, Flexbox, FormItem, Input, InputPassword } from '@lobehub/ui';
 import { Divider, Form, type FormInstance, Radio } from 'antd';
 import isEqual from 'fast-deep-equal';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import KeyValueEditor from '@/components/KeyValueEditor';
@@ -15,6 +15,7 @@ import ArgsInput from './ArgsInput';
 import CollapsibleSection from './CollapsibleSection';
 import MCPTypeSelect from './MCPTypeSelect';
 import QuickImportSection from './QuickImportSection';
+import { useMcpOAuth } from './hooks/useMcpOAuth';
 
 interface MCPManifestFormProps {
   form: FormInstance;
@@ -27,24 +28,38 @@ const STDIO_ARGS = ['customParams', 'mcp', 'args'];
 const STDIO_ENV = ['customParams', 'mcp', 'env'];
 const MCP_TYPE = ['customParams', 'mcp', 'type'];
 const DESC_TYPE = ['customParams', 'description'];
-// 新增认证相关常量
 const AUTH_TYPE = ['customParams', 'mcp', 'auth', 'type'];
 const AUTH_TOKEN = ['customParams', 'mcp', 'auth', 'token'];
-// 新增 headers 相关常量
 const HEADERS = ['customParams', 'mcp', 'headers'];
 
 const MCPManifestForm = ({ form, isEditMode }: MCPManifestFormProps) => {
   const { t } = useTranslation('plugin');
   const mcpType = Form.useWatch(MCP_TYPE, form);
   const authType = Form.useWatch(AUTH_TYPE, form);
+  const mcpUrl = Form.useWatch(HTTP_URL_KEY, form);
+  const identifier = Form.useWatch('identifier', form) ?? 'temp-test-id';
+
+  const {
+    connect: connectOAuth,
+    connected: oauthConnected,
+    discoverResult: oauthDiscoverResult,
+    isConnecting: isOAuthConnecting,
+    isDiscovering: isOAuthDiscovering,
+  } = useMcpOAuth(
+    mcpType === 'http' && typeof mcpUrl === 'string' ? mcpUrl : undefined,
+    identifier,
+  );
+
+  useEffect(() => {
+    if (oauthDiscoverResult?.requiresOAuth) {
+      form.setFieldValue(AUTH_TYPE, 'oauth');
+    }
+  }, [oauthDiscoverResult?.requiresOAuth, form]);
 
   const pluginIds = useToolStore(pluginSelectors.storeAndInstallPluginsIdList);
   const [isTesting, setIsTesting] = useState(false);
   const testMcpConnection = useToolStore((s) => s.testMcpConnection);
 
-  // 使用 identifier 来跟踪测试状态（如果表单中有的话）
-  const formValues = form.getFieldsValue();
-  const identifier = formValues?.identifier || 'temp-test-id';
   const testState = useToolStore(mcpStoreSelectors.getMCPConnectionTestState(identifier), isEqual);
 
   const [connectionError, setConnectionError] = useState<string | null>(null);
@@ -62,7 +77,6 @@ const MCPManifestForm = ({ form, isEditMode }: MCPManifestFormProps) => {
         ...(mcpType === 'http' ? [HTTP_URL_KEY] : [STDIO_COMMAND, STDIO_ARGS]),
       ];
 
-      // 如果是 HTTP 类型，还需要验证认证字段
       if (mcpType === 'http') {
         fieldsToValidate.push(AUTH_TYPE);
         const currentAuthType = form.getFieldValue(AUTH_TYPE);
@@ -222,10 +236,54 @@ const MCPManifestForm = ({ form, isEditMode }: MCPManifestFormProps) => {
                       label: t('dev.mcp.auth.bear'),
                       value: 'bearer',
                     },
+                    {
+                      label: t('dev.mcp.auth.oauth.label', {
+                        defaultValue: 'OAuth (Connect)',
+                      }),
+                      value: 'oauth',
+                    },
                   ]}
                   style={{ width: '100%' }}
                 />
               </FormItem>
+              {authType === 'oauth' && (
+                <FormItem
+                  desc={t('dev.mcp.auth.oauth.desc', {
+                    defaultValue: 'Connect with the provider to authorize this MCP.',
+                  })}
+                >
+                  <Flexbox gap={8} horizontal>
+                    <Button
+                      loading={isOAuthConnecting || isOAuthDiscovering}
+                      onClick={async () => {
+                        try {
+                          await connectOAuth();
+                        } catch (err) {
+                          setConnectionError(
+                            err instanceof Error ? err.message : t('dev.mcp.oauth.connectFailed'),
+                          );
+                        }
+                      }}
+                      type="primary"
+                    >
+                      {oauthConnected
+                        ? t('dev.mcp.oauth.reconnect', { defaultValue: 'Reconnect' })
+                        : t('dev.mcp.oauth.connect', {
+                            defaultValue: 'Connect with {{provider}}',
+                            provider:
+                              oauthDiscoverResult?.providerName ??
+                              (mcpUrl ? new URL(mcpUrl).hostname : null) ??
+                              'Provider',
+                          })}
+                    </Button>
+                    {oauthConnected && (
+                      <span style={{ alignSelf: 'center', color: 'var(--colorSuccess)' }}>
+                        {t('dev.mcp.oauth.connected', { defaultValue: 'Connected' })}
+                      </span>
+                    )}
+                  </Flexbox>
+                </FormItem>
+              )}
               {authType === 'bearer' && (
                 <FormItem
                   desc={t('dev.mcp.auth.token.desc')}

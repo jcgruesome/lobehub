@@ -9,6 +9,7 @@ import { PlusIcon } from 'lucide-react';
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import { useMcpOAuth } from '@/features/PluginDevModal/MCPManifestForm/hooks/useMcpOAuth';
 import { useMarketAuth } from '@/layout/AuthProvider/MarketAuth';
 import { useAgentStore } from '@/store/agent';
 import { agentSelectors } from '@/store/agent/selectors';
@@ -18,6 +19,7 @@ import {
   KlavisServerStatus,
   klavisStoreSelectors,
 } from '@/store/tool/slices/klavisStore';
+import { pluginSelectors } from '@/store/tool/slices/plugin/selectors';
 import { useUserStore } from '@/store/user';
 import { userProfileSelectors } from '@/store/user/selectors';
 
@@ -45,7 +47,15 @@ interface PendingMarketTool {
   label: string;
 }
 
-type PendingAuthTool = PendingKlavisTool | PendingMarketTool;
+interface PendingMcpOAuthTool {
+  authType: 'mcp-oauth';
+  icon?: string;
+  identifier: string;
+  label: string;
+  mcpUrl: string;
+}
+
+type PendingAuthTool = PendingKlavisTool | PendingMarketTool | PendingMcpOAuthTool;
 
 interface KlavisToolAuthItemProps {
   onAuthComplete: () => void;
@@ -278,30 +288,97 @@ const MarketToolAuthItem = memo<MarketToolAuthItemProps>(({ tool }) => {
 
 MarketToolAuthItem.displayName = 'MarketToolAuthItem';
 
+interface McpOAuthToolAuthItemProps {
+  tool: PendingMcpOAuthTool;
+}
+
+const McpOAuthToolAuthItem = memo<McpOAuthToolAuthItemProps>(({ tool }) => {
+  const { t } = useTranslation('chat');
+  const { connect, connected, isConnecting } = useMcpOAuth(tool.mcpUrl, tool.identifier, {
+    skipDiscover: true,
+  });
+
+  const handleAuthorize = useCallback(async () => {
+    try {
+      await connect();
+      // When OAuth completes, useMcpOAuth sets connected and this item returns null
+    } catch (error) {
+      console.error('[ToolAuthAlert] MCP OAuth failed:', error);
+    }
+  }, [connect]);
+
+  if (connected) return null;
+
+  const isLoading = isConnecting;
+
+  return (
+    <Flexbox
+      align="center"
+      gap={12}
+      horizontal
+      justify="space-between"
+      onClick={handleAuthorize}
+      style={{
+        cursor: 'pointer',
+      }}
+    >
+      <Flexbox align="center" gap={8} horizontal>
+        {tool.icon ? (
+          <Avatar alt={tool.label} avatar={tool.icon} size={20} style={{ flex: 'none' }} />
+        ) : (
+          <Icon icon={PlusIcon} size={20} />
+        )}
+        <Text>{tool.label}</Text>
+      </Flexbox>
+      <Button
+        disabled={isLoading}
+        icon={PlusIcon}
+        loading={isLoading}
+        onClick={handleAuthorize}
+        size="small"
+        type="text"
+      >
+        {isLoading ? t('toolAuth.authorizing') : t('toolAuth.authorize')}
+      </Button>
+    </Flexbox>
+  );
+});
+
+McpOAuthToolAuthItem.displayName = 'McpOAuthToolAuthItem';
+
 const ToolAuthAlert = memo(() => {
   const { t } = useTranslation('chat');
 
   const plugins = useAgentStore(agentSelectors.currentAgentPlugins, isEqual);
   const klavisServers = useToolStore(klavisStoreSelectors.getServers, isEqual);
   const { isAuthenticated: isMarketAuthenticated } = useMarketAuth();
+  const [mcpOAuthNeedingAuth, setMcpOAuthNeedingAuth] = useState<PendingMcpOAuthTool[]>([]);
 
-  // Filter out tools that need authorization
-  const pendingAuthTools = useMemo<PendingAuthTool[]>(() => {
+  // Klavis + Market list (sync)
+  const syncPendingTools = useMemo<PendingAuthTool[]>(() => {
     const result: PendingAuthTool[] = [];
+    const toolState = useToolStore.getState();
 
     for (const pluginId of plugins) {
-      // Check if this is a Klavis tool
+      const customPlugin = pluginSelectors.getCustomPluginById(pluginId)(toolState);
+      const isMcpOAuth =
+        customPlugin?.customParams?.mcp?.url &&
+        customPlugin.customParams.mcp.auth?.type === 'oauth2';
+      if (isMcpOAuth) {
+        // MCP OAuth handled in effect below (async status check)
+        continue;
+      }
+
       const klavisType = KLAVIS_SERVER_TYPES.find((t) => t.identifier === pluginId);
       if (klavisType) {
         const server = klavisServers.find((s) => s.identifier === pluginId);
-        // Not installed or pending auth
-        if (!server || server.status === KlavisServerStatus.PENDING_AUTH) {
+        // Only show Klavis when a server exists and needs auth; don't prompt when no server (e.g. user uses MCP instead)
+        if (server && server.status === KlavisServerStatus.PENDING_AUTH) {
           result.push({ ...klavisType, authType: 'klavis', server });
         }
         continue;
       }
 
-      // Check if this is a Market auth tool
       const marketTool = MARKET_AUTH_TOOLS.find((t) => t.identifier === pluginId);
       if (marketTool && !isMarketAuthenticated) {
         result.push({ ...marketTool, authType: 'market' });
@@ -310,6 +387,58 @@ const ToolAuthAlert = memo(() => {
 
     return result;
   }, [plugins, klavisServers, isMarketAuthenticated]);
+
+  // Fetch MCP OAuth status and only include tools that are not connected
+  useEffect(() => {
+    const toolState = useToolStore.getState();
+    const candidates: PendingMcpOAuthTool[] = [];
+
+    for (const pluginId of plugins) {
+      const customPlugin = pluginSelectors.getCustomPluginById(pluginId)(toolState);
+      const isMcpOAuth =
+        customPlugin?.customParams?.mcp?.url &&
+        customPlugin.customParams.mcp.auth?.type === 'oauth2';
+      if (!isMcpOAuth) continue;
+
+      const meta = pluginSelectors.getPluginMetaById(pluginId)(toolState);
+      candidates.push({
+        authType: 'mcp-oauth',
+        icon: meta?.avatar,
+        identifier: pluginId,
+        label: meta?.title ?? pluginId,
+        mcpUrl: customPlugin!.customParams!.mcp!.url!,
+      });
+    }
+
+    if (candidates.length === 0) {
+      setMcpOAuthNeedingAuth([]);
+      return;
+    }
+
+    let cancelled = false;
+    Promise.all(
+      candidates.map(async (tool) => {
+        const res = await fetch(
+          `/api/mcp/oauth/status?pluginId=${encodeURIComponent(tool.identifier)}`,
+        );
+        if (!res.ok) return tool;
+        const data = await res.json();
+        return data.connected ? null : tool;
+      }),
+    ).then((results) => {
+      if (cancelled) return;
+      setMcpOAuthNeedingAuth(results.filter((r): r is PendingMcpOAuthTool => r !== null));
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [plugins]);
+
+  const pendingAuthTools = useMemo(
+    () => [...syncPendingTools, ...mcpOAuthNeedingAuth],
+    [syncPendingTools, mcpOAuthNeedingAuth],
+  );
 
   // Don't render if no pending auth tools
   if (pendingAuthTools.length === 0) {
@@ -332,6 +461,8 @@ const ToolAuthAlert = memo(() => {
                   }}
                   tool={tool}
                 />
+              ) : tool.authType === 'mcp-oauth' ? (
+                <McpOAuthToolAuthItem key={tool.identifier} tool={tool} />
               ) : (
                 <MarketToolAuthItem key={tool.identifier} tool={tool} />
               ),
